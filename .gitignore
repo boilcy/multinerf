@@ -6,3 +6,5 @@ tests/__pycache__/
 .vscode/
 .idea/
 __MACOSX/
+datasets/
+nerf_results/

@@ -78,9 +78,9 @@ class Config:
   vis_decimate: int = 0
 
   # Only used by train.py:
-  max_steps: int = 250000  # The number of optimization steps.
+  max_steps: int = 25000  # The number of optimization steps.
   early_exit_steps: Optional[int] = None  # Early stopping, for debugging.
-  checkpoint_every: int = 25000  # The number of steps to save a checkpoint.
+  checkpoint_every: int = 2500  # The number of steps to save a checkpoint.
   print_every: int = 100  # The number of steps between reports to tensorboard.
   train_render_every: int = 5000  # Steps between test set renders when training
   cast_rays_in_train_step: bool = False  # If True, compute rays in train step.

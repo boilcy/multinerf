@@ -147,6 +147,42 @@ class NeRFSceneManager(pycolmap.SceneManager):
       camtype = camera_utils.ProjectionType.FISHEYE
 
     return names, poses, pixtocam, params, camtype
+  
+  def generate_obs(self, obs_dir):
+    self.load_images()
+    self.load_cameras()
+
+    transforms_dict = {}
+    transforms_dict["frames"] = []
+
+    cam = self.cameras[1]
+    transforms_dict["i"] = [cam.fx, cam.fy, cam.cx, cam.cy]
+
+    fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+    pixtocam = np.linalg.inv(camera_utils.intrinsic_matrix(fx, fy, cx, cy))
+    
+    imdata = self.images
+    bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+
+    path_fn = lambda x: os.path.join(obs_dir, x)
+
+    for k in imdata:
+        im = imdata[k]
+        #im.save(path_fn(f"{k}.png"))
+        #utils.save_img_u8(, path_fn(f"{k}.png"))
+
+        rot = im.R()
+        trans = im.tvec.reshape(3, 1)
+        w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
+        c2w = np.linalg.inv(w2c)
+        pose = c2w[:4, :4]
+        transforms_dict["frames"].append({'file_path': im.name,'transform_matrix': pose.tolist()})
+        if k>4:
+          break
+    with open(path_fn("transforms.json"),"w") as f:
+        json.dump(transforms_dict, f)
+        print("generate obs finished")
+    return None
 
 
 def load_blender_posedata(data_dir, split=None):

@@ -17,8 +17,8 @@ export CUDA_VISIBLE_DEVICES=0
 
 SCENE=flower
 EXPERIMENT=llff
-DATA_DIR=/usr/local/google/home/barron/tmp/nerf_data/nerf_llff_data
-CHECKPOINT_DIR=/usr/local/google/home/barron/tmp/nerf_results/"$EXPERIMENT"/"$SCENE"
+DATA_DIR=/home/yc/code/data/nerf_llff_data
+CHECKPOINT_DIR=/home/yc/code/nerf_results/"$EXPERIMENT"/"$SCENE"
 
 rm "$CHECKPOINT_DIR"/*
 python -m train \
