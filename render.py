@@ -138,6 +138,7 @@ def main(unused_argv):
       fn(*args, **kwargs)
 
   for idx in range(dataset.size):
+    alpha = idx/dataset.size
     if idx % config.render_num_jobs != config.render_job_id:
       continue
     # If current image and next image both already exist, skip ahead.
@@ -154,7 +155,7 @@ def main(unused_argv):
     train_frac = 1.
     rendering = models.render_image(
         functools.partial(render_eval_pfn, state.params, train_frac),
-        rays, None, config)
+        None, rays, config, alpha=alpha)
     print(f'Rendered in {(time.time() - eval_start_time):0.3f}s')
 
     if jax.host_id() != 0:  # Only record via host 0.

@@ -253,7 +253,7 @@ def create_train_step(model: models.Model,
         rng: jnp.ndarray, updated random number generator.
     """
     rng, key = random.split(rng)
-
+    print("train_step")
     def loss_fn(variables):
       rays = batch.rays
       if config.cast_rays_in_train_step:
@@ -262,10 +262,11 @@ def create_train_step(model: models.Model,
       # Indicates whether we need to compute output normal or depth maps in 2D.
       compute_extras = (
           config.compute_disp_metrics or config.compute_normal_metrics)
-
+      print("loss_fn")
       renderings, ray_history = model.apply(
           variables,
           key if config.randomized else None,
+          1.0, 
           rays,
           train_frac=train_frac,
           compute_extras=compute_extras,
@@ -368,11 +369,13 @@ def create_optimizer(
 def create_render_fn(model: models.Model):
   """Creates pmap'ed function for full image rendering."""
 
-  def render_eval_fn(variables, train_frac, _, rays):
+  # the underline is rng..
+  def render_eval_fn(variables, train_frac, _, alpha, rays):
     return jax.lax.all_gather(
         model.apply(
             variables,
             None,  # Deterministic.
+            alpha,
             rays,
             train_frac=train_frac,
             compute_extras=True),
@@ -381,7 +384,7 @@ def create_render_fn(model: models.Model):
   # pmap over only the data input.
   render_eval_pfn = jax.pmap(
       render_eval_fn,
-      in_axes=(None, None, None, 0),
+      in_axes=(None, None, None, None, 0),
       axis_name='batch',
   )
   return render_eval_pfn

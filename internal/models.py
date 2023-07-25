@@ -75,6 +75,7 @@ class Model(nn.Module):
   def __call__(
       self,
       rng,
+      alpha,
       rays,
       train_frac,
       compute_extras,
@@ -92,9 +93,9 @@ class Model(nn.Module):
     Returns:
       ret: list, [*(rgb, distance, acc)]
     """
-
     # Construct MLPs. WARNING: Construction order may matter, if MLP weights are
     # being regularized.
+    
     nerf_mlp = NerfMLP()
     prop_mlp = nerf_mlp if self.single_mlp else PropMLP()
 
@@ -223,6 +224,7 @@ class Model(nn.Module):
       ray_results = mlp(
           key,
           gaussians,
+          alpha = alpha,
           viewdirs=rays.viewdirs if self.use_viewdirs else None,
           imageplane=rays.imageplane,
           glo_vec=None if is_prop else glo_vec,
@@ -331,6 +333,7 @@ def construct_model(rng, rays, config):
   init_variables = model.init(
       rng,  # The RNG used by flax to initialize random weights.
       rng=None,  # The RNG used by sampling within the model.
+      alpha=1.0,  # The initial alpha value.
       rays=ray,
       train_frac=1.,
       compute_extras=False,
@@ -403,6 +406,7 @@ class MLP(nn.Module):
   def __call__(self,
                rng,
                gaussians,
+               alpha=1.0,
                viewdirs=None,
                imageplane=None,
                glo_vec=None,
@@ -432,13 +436,13 @@ class MLP(nn.Module):
       normals_pred: jnp.ndarray(float32), with a shape of [..., 3], or None.
       roughness: jnp.ndarray(float32), with a shape of [..., 1], or None.
     """
-
+    
     dense_layer = functools.partial(
         nn.Dense, kernel_init=getattr(jax.nn.initializers, self.weight_init)())
 
     density_key, rng = random_split(rng)
 
-    def predict_density(means, covs):
+    def predict_density(means, covs, alpha):
       """Helper function to output density."""
       # Encode input positions
 
@@ -450,7 +454,16 @@ class MLP(nn.Module):
       x = coord.integrated_pos_enc(lifted_means, lifted_vars,
                                    self.min_deg_point, self.max_deg_point)
 
-      inputs = x
+      dim = x.shape[-1] // 2
+      alpha = jnp.clip(jnp.round(alpha * dim), 0, dim)
+
+      indices = jnp.arange(dim)
+      mask = (indices < alpha).astype(x.dtype)
+      mask = jnp.concatenate([mask, mask], axis=0)
+
+      inputs = x * mask
+      #inputs = jnp.concatenate([x[..., :alpha], jnp.zeros_like(x[..., alpha:dim]), x[..., dim:dim+alpha], jnp.zeros_like(x[..., dim+alpha:])], axis=-1)
+      
       # Evaluate network to produce the output density.
       for i in range(self.net_depth):
         x = dense_layer(self.net_width)(x)
@@ -466,7 +479,7 @@ class MLP(nn.Module):
 
     means, covs = gaussians
     if self.disable_density_normals:
-      raw_density, x = predict_density(means, covs)
+      raw_density, x = predict_density(means, covs, alpha)
       raw_grad_density = None
       normals = None
     else:
@@ -476,9 +489,9 @@ class MLP(nn.Module):
 
       # Evaluate the network and its gradient on the flattened input.
       predict_density_and_grad_fn = jax.vmap(
-          jax.value_and_grad(predict_density, has_aux=True), in_axes=(0, 0))
+          jax.value_and_grad(predict_density, has_aux=True), in_axes=(0, 0, None))
       (raw_density_flat, x_flat), raw_grad_density_flat = (
-          predict_density_and_grad_fn(means_flat, covs_flat))
+          predict_density_and_grad_fn(means_flat, covs_flat, alpha))
 
       # Unflatten the output.
       raw_density = raw_density_flat.reshape(means.shape[:-1])
@@ -625,9 +638,10 @@ class PropMLP(MLP):
 def render_image(render_fn: Callable[[jnp.array, utils.Rays],
                                      Tuple[List[Mapping[Text, jnp.ndarray]],
                                            List[Tuple[jnp.ndarray, ...]]]],
-                 rays: utils.Rays,
                  rng: jnp.array,
+                 rays: utils.Rays,
                  config: configs.Config,
+                 alpha: float = 1,
                  verbose: bool = True) -> MutableMapping[Text, Any]:
   """Render all the pixels of an image (in test mode).
 
@@ -652,7 +666,7 @@ def render_image(render_fn: Callable[[jnp.array, utils.Rays],
   idx0s = range(0, num_rays, config.render_chunk_size)
   for i_chunk, idx0 in enumerate(idx0s):
     # pylint: disable=cell-var-from-loop
-    if verbose and i_chunk % max(1, len(idx0s) // 10) == 0:
+    if verbose and i_chunk % max(1, len(idx0s) // 4) == 0:
       print(f'Rendering chunk {i_chunk}/{len(idx0s)-1}')
     chunk_rays = (
         jax.tree_util.tree_map(
@@ -670,7 +684,7 @@ def render_image(render_fn: Callable[[jnp.array, utils.Rays],
     start, stop = host_id * rays_per_host, (host_id + 1) * rays_per_host
     chunk_rays = jax.tree_util.tree_map(lambda r: utils.shard(r[start:stop]),
                                         chunk_rays)
-    chunk_renderings, _ = render_fn(rng, chunk_rays)
+    chunk_renderings, _ = render_fn(rng, alpha, chunk_rays)
 
     # Unshard the renderings.
     chunk_renderings = jax.tree_util.tree_map(

@@ -47,7 +47,7 @@ def load_dataset(split, train_dir, config):
       'llff': LLFF,
       'tat_nerfpp': TanksAndTemplesNerfPP,
       'tat_fvs': TanksAndTemplesFVS,
-      'dtu': DTU,
+      'dtu': DTU
   }
   return dataset_dict[config.dataset_loader](split, train_dir, config)
 
@@ -148,43 +148,6 @@ class NeRFSceneManager(pycolmap.SceneManager):
 
     return names, poses, pixtocam, params, camtype
   
-  def generate_obs(self, obs_dir):
-    self.load_images()
-    self.load_cameras()
-
-    transforms_dict = {}
-    transforms_dict["frames"] = []
-
-    cam = self.cameras[1]
-    transforms_dict["i"] = [cam.fx, cam.fy, cam.cx, cam.cy]
-
-    fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-    pixtocam = np.linalg.inv(camera_utils.intrinsic_matrix(fx, fy, cx, cy))
-    
-    imdata = self.images
-    bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
-
-    path_fn = lambda x: os.path.join(obs_dir, x)
-
-    for k in imdata:
-        im = imdata[k]
-        #im.save(path_fn(f"{k}.png"))
-        #utils.save_img_u8(, path_fn(f"{k}.png"))
-
-        rot = im.R()
-        trans = im.tvec.reshape(3, 1)
-        w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
-        c2w = np.linalg.inv(w2c)
-        pose = c2w[:4, :4]
-        transforms_dict["frames"].append({'file_path': im.name,'transform_matrix': pose.tolist()})
-        if k>4:
-          break
-    with open(path_fn("transforms.json"),"w") as f:
-        json.dump(transforms_dict, f)
-        print("generate obs finished")
-    return None
-
-
 def load_blender_posedata(data_dir, split=None):
   """Load poses from `transforms.json` file, as used in Blender/NGP datasets."""
   suffix = '' if split is None else f'_{split}'
@@ -539,6 +502,47 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     self._test_camera_idx = (self._test_camera_idx + 1) % self._n_examples
     return self.generate_ray_batch(cam_idx)
 
+  def generate_pose_batch(self, cam_idx: int, POI=None):
+    num_patches = self._batch_size // self._patch_size ** 2
+    lower_border = self._num_border_pixels_to_mask
+    upper_border = self._num_border_pixels_to_mask + self._patch_size - 1
+
+    if POI is not None:
+      # Randomly choose `num_patches` POIs.
+      poi_indices = np.random.choice(POI.shape[0], size=num_patches, replace=False)
+      poi_samples = POI[poi_indices]
+
+      pix_x_int = poi_samples[:, 1].reshape(num_patches, 1, 1)
+      pix_y_int = poi_samples[:, 0].reshape(num_patches, 1, 1)
+    else:
+      pix_x_int = np.random.randint(lower_border, self.width - upper_border, (num_patches, 1, 1))
+      pix_y_int = np.random.randint(lower_border, self.height - upper_border, (num_patches, 1, 1))
+    # Add patch coordinate offsets.
+    # Shape will broadcast to (num_patches, _patch_size, _patch_size).
+    patch_dx_int, patch_dy_int = camera_utils.pixel_coordinates(self._patch_size, self._patch_size)
+    
+    pix_x_int = pix_x_int + patch_dx_int
+    pix_y_int = pix_y_int + patch_dy_int
+    
+    lossmult = None
+
+    #cam_idx = np.zeros((num_patches, 1, 1)).astype('int') + cam_idx
+    return self._make_ray_batch(pix_x_int, pix_y_int, cam_idx, lossmult=lossmult)
+
+
+  def load_data_property(self, cam_idx):
+    height, width = self.images.shape[1:3]
+    p2c = self.pixtocams
+    camtype = self.camtype
+    distortion_param = self.distortion_params
+    p2c_ndc = self.pixtocam_ndc
+    camera = (p2c, distortion_param, p2c_ndc, camtype)
+    return height, width, camera
+
+  def load_obs_data(self, cam_idx):
+    obs_img = self.images[cam_idx]
+    obs_img_c2w = self.camtoworlds[cam_idx]
+    return obs_img, obs_img_c2w
 
 class Blender(Dataset):
   """Blender Dataset."""

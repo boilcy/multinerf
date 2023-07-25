@@ -48,7 +48,7 @@ class Config:
   """Configuration flags for everything."""
   dataset_loader: str = 'llff'  # The type of dataset loader to use.
   batching: str = 'all_images'  # Batch composition, [single_image, all_images].
-  batch_size: int = 16384  # The number of rays/pixels in each batch.
+  batch_size: int = 1024  # The number of rays/pixels in each batch.
   patch_size: int = 1  # Resolution of patches sampled for training batches.
   factor: int = 0  # The downsample factor of images, 0 for no downsampling.
   load_alphabetical: bool = True  # Load images in COLMAP vs alphabetical
@@ -78,9 +78,9 @@ class Config:
   vis_decimate: int = 0
 
   # Only used by train.py:
-  max_steps: int = 25000  # The number of optimization steps.
+  max_steps: int = 250000  # The number of optimization steps.
   early_exit_steps: Optional[int] = None  # Early stopping, for debugging.
-  checkpoint_every: int = 2500  # The number of steps to save a checkpoint.
+  checkpoint_every: int = 10000  # The number of steps to save a checkpoint.
   print_every: int = 100  # The number of steps between reports to tensorboard.
   train_render_every: int = 5000  # Steps between test set renders when training
   cast_rays_in_train_step: bool = False  # If True, compute rays in train step.
@@ -163,7 +163,24 @@ class Config:
   autoexpose_renders: bool = False  # During rendering, autoexpose each image.
   # For raw test scenes, use affine raw-space color correction.
   eval_raw_affine_cc: bool = False
-
+  
+  # pose estimate
+  pose_lr_init: float = 0.01
+  pose_lr_final: float = 0.0005
+  pose_max_steps: int = 400
+  pose_sampling_strategy: str = 'random'
+  pose_delta_phi: float = 10.
+  pose_delta_theta: float = 0.
+  pose_delta_psi: float = 0.
+  pose_delta_x: float = 0.2
+  pose_delta_y: float = 0.
+  pose_delta_z: float = 0.
+  pose_optim_method: str = "manifold"
+  pose_w_alpha: bool = True
+  pose_alpha0: float = 0.5
+  pose_alpha_linear: bool = False
+  pose_exam_id: int = -1
+  pose_render_train: bool = False
 
 def define_common_flags():
   # Define the flags used by both train.py and eval.py

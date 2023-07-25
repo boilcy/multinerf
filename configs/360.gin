@@ -16,4 +16,3 @@ NerfMLP.warp_fn = @coord.contract
 NerfMLP.net_depth = 8
 NerfMLP.net_width = 1024
 NerfMLP.disable_density_normals = True
-

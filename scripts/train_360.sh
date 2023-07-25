@@ -15,10 +15,10 @@
 
 export CUDA_VISIBLE_DEVICES=0
 
-SCENE=bicycle
+SCENE=pinecone
 EXPERIMENT=360
-DATA_DIR=/home/yc/code/data/360_v2
-CHECKPOINT_DIR=/home/yc/code/nerf_results/"$EXPERIMENT"/"$SCENE"
+DATA_DIR=/home/yc/code/multinerf/datasets/nerf_real_360
+CHECKPOINT_DIR=/home/yc/multinerf/nerf_results/"$EXPERIMENT"/"$SCENE"
 # If running one of the indoor scenes, add
 # --gin_bindings="Config.factor = 2"
 

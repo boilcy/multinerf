@@ -1,170 +1,187 @@
-"""localization script."""
-
-import concurrent.futures
 import functools
-import glob
 import os
-import time
-import json
-
-from absl import app
-from flax.training import checkpoints
+import flax
 import gin
-from internal import configs
-from internal import datasets
-from internal import models
-from internal import train_utils
-from internal import utils
+import datetime
+from absl import app
 import jax
-from jax import random
-from matplotlib import cm
-import mediapy as media
+import jax.numpy as jnp
 import numpy as np
+from jax import random, value_and_grad
+from flax.training import checkpoints
+import matplotlib.pyplot as plt
+from internal import camera_utils
+from internal import train_utils
+from internal import models
+from internal import datasets
+from internal import configs
+from internal import utils
+from inerf_helper import setup_model
+from utils import get_noised_pose, extract_delta, find_Edge, find_EdgeRegion, create_alpha_fn
 
 configs.define_common_flags()
 jax.config.parse_flags_with_absl()
 
-rot_psi = lambda phi: np.array([
-        [1, 0, 0, 0],
-        [0, np.cos(phi), -np.sin(phi), 0],
-        [0, np.sin(phi), np.cos(phi), 0],
-        [0, 0, 0, 1]])
+def create_train_step(model: models.Model,
+                      modelState,
+                      poseModel,
+                      camera,
+                      config: configs.Config,
+                      camtype):
+    
+    def train_step(batch, poseState, alpha):
+        def loss_fn(variables):
+            rays = batch.rays
+            c2w = poseModel.apply(variables, camera[1])
+            _camera = (camera[0], c2w, camera[2],camera[3])
+            rays = camera_utils.cast_ray_batch(_camera, rays, camtype, xnp=jnp)
 
-rot_theta = lambda th: np.array([
-        [np.cos(th), 0, -np.sin(th), 0],
-        [0, 1, 0, 0],
-        [np.sin(th), 0, np.cos(th), 0],
-        [0, 0, 0, 1]])
+            renderings, _ = model.apply(
+                modelState.params,
+                None,
+                alpha,
+                rays,
+                train_frac=1.0,
+                compute_extras=False,
+                zero_glo=False)
 
-rot_phi = lambda psi: np.array([
-        [np.cos(psi), -np.sin(psi), 0, 0],
-        [np.sin(psi), np.cos(psi), 0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1]])
+            mse = jnp.mean(jnp.square(renderings[-1]['rgb'] - batch.rgb[..., :3]))
+            return mse
+        
+        loss_grad_fn = jax.value_and_grad(loss_fn, argnums=(0,), has_aux=False)
+        mse, grad = loss_grad_fn(poseState.params)
+        pmean = lambda x: jax.lax.pmean(x, axis_name='batch')
+        grad = pmean(grad)
 
-trans_t = lambda t: np.array([
-        [1, 0, 0, 0],
-        [0, 1, 0, 0],
-        [0, 0, 1, t],
-        [0, 0, 0, 1]])
+        grad = train_utils.clip_gradients(grad, config)
+        grad = jax.tree_util.tree_map(jnp.nan_to_num, grad)
 
-def load_obs(data_dir, obs_img_id, d):
-    with open(os.path.join(data_dir, 'transforms.json'), 'r') as fp:
-        meta = json.load(fp)
-    frames = meta['frames']
-    obs_img_path = os.path.join(data_dir, frames[obs_img_id]['file_path'])
-    obs_img = utils.load_img(obs_img_path)
+        new_poseState = poseState.apply_gradients(grads=grad)
 
-    obs_img_pose = np.array(frames[obs_img_id]['transform_matrix']).astype(np.float32)
-    phi, theta, psi, t = d
-    start_pose =  trans_t(t) @ rot_phi(phi/180.*np.pi) @ rot_theta(theta/180.*np.pi) @ rot_psi(psi/180.*np.pi)  @ obs_img_pose
-    return obs_img, obs_img_pose, start_pose, [H, W, focal]
+        return new_poseState
 
+    train_vstep = jax.vmap(
+        train_step,
+        axis_name='batch',
+        in_axes=(None, 0, None))
+    return train_vstep
 
-def main(unused_argv):
+def load_model(config, rng):
+    dummy_rays = utils.dummy_rays(include_exposure_idx=config.rawnerf_mode, include_exposure_values=True)
+    model, variables = models.construct_model(rng, dummy_rays, config)
+    state, _ = train_utils.create_optimizer(config, variables)
+    state = checkpoints.restore_checkpoint(config.checkpoint_dir, state)
+    step = int(state.step)
+    print(f'Load checkpoint at step {step}.')
+    render_eval_pfn = train_utils.create_render_fn(model)
+    return model, state, render_eval_pfn
 
-  config = configs.load_config(save_config=False)
+def save_pose_config(out_dir, config):
+    fn = os.path.join(out_dir, 'poseconfig.txt')
+    with open(fn, 'w') as f:
+        f.write(f'render_train={config.pose_render_train}\n')
+        f.write(f'batch_size={config.batch_size}\n')
+        f.write(f'patch_size={config.patch_size}\n')
+        f.write(f'max_steps={config.pose_max_steps}\n')
+        f.write(f'lr_init={config.pose_lr_init}\n')
+        f.write(f'lr_final={config.pose_lr_final}\n')
+        f.write(f'sampling_strategy={config.pose_sampling_strategy}\n')
+        f.write(f'with_filter={config.pose_w_alpha}\n')
+        f.write(f'optim_method={config.pose_optim_method}\n')
+        f.write(f'alpha0={config.pose_alpha0}\n')
+        f.write(f'delta_phi={config.pose_delta_phi}\n')
+        f.write(f'delta_theta={config.pose_delta_theta}\n')
+        f.write(f'delta_psi={config.pose_delta_psi}\n')
+        f.write(f'delta_x={config.pose_delta_x}\n')
+        f.write(f'delta_y={config.pose_delta_y}\n')
+        f.write(f'delta_z={config.pose_delta_z}\n')
 
-  dataset = datasets.load_dataset('test', config.data_dir, config)
+def save_final_err(out_dir, *args):
+    fn = os.path.join(out_dir, 'err.txt')
+    with open(fn, 'w+') as f:
+        for err in args:
+            if isinstance(err, list):
+                f.write("|".join(err))
+            else:
+                f.write(f"{err}")
+            f.write("\n")
+            
+def main(unused_arg):
+    config = configs.load_config(save_config=False)
+    
+    render_dir = config.render_dir
+    exam_id = config.pose_exam_id
+    out_dir = os.path.join(render_dir, f'{exam_id}/')
+    if not utils.isdir(out_dir):
+        utils.makedirs(out_dir)
+    path_fn = lambda x: os.path.join(out_dir, x)
+    
+    save_pose_config(out_dir, config)
+    
+    rng = random.PRNGKey(0)
+    model, modelState, render_eval_pfn = load_model(config, rng)
 
-  key = random.PRNGKey(20200823)
-  _, state, render_eval_pfn, _, _ = train_utils.setup_model(config, key)
+    # 指定相机
+    cam_idx = 0
 
-  if config.rawnerf_mode:
-    postprocess_fn = dataset.metadata['postprocess_fn']
-  else:
-    postprocess_fn = lambda z: z
+    dataset = datasets.load_dataset('test', config.data_dir, config)
+    p2c, distortion_param, p2c_ndc, camtype = dataset.load_data_property(cam_idx)
+    obs_img, obs_img_c2w = dataset.load_obs_data(cam_idx)
 
-  state = checkpoints.restore_checkpoint(config.checkpoint_dir, state)
-  step = int(state.step)
-  print(f'Rendering checkpoint at step {step}.')
+    delta = (config.pose_delta_x, config.pose_delta_y, config.pose_delta_z, config.pose_delta_phi, config.pose_delta_theta, config.pose_delta_psi)
+    start_c2w = get_noised_pose(obs_img_c2w, delta)
 
-  out_name = 'path_renders' if config.render_path else 'test_preds'
-  out_name = f'{out_name}_step_{step}'
-  base_dir = config.render_dir
-  if base_dir is None:
-    base_dir = os.path.join(config.checkpoint_dir, 'render')
-  out_dir = os.path.join(base_dir, out_name)
-  if not utils.isdir(out_dir):
-    utils.makedirs(out_dir)
+    start_camera = (p2c, start_c2w, distortion_param, p2c_ndc)
 
-  path_fn = lambda x: os.path.join(out_dir, x)
+    np_to_jax = lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x
+    start_camera = tuple(np_to_jax(x) for x in start_camera)
 
-  # Ensure sufficient zero-padding of image indices in output filenames.
-  zpad = max(3, len(str(dataset.size - 1)))
-  idx_to_str = lambda idx: str(idx).zfill(zpad)
+    #euler_ref, t_ref = extract_delta(obs_img_c2w)
 
-  if config.render_save_async:
-    async_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-    async_futures = []
-    def save_fn(fn, *args, **kwargs):
-      async_futures.append(async_executor.submit(fn, *args, **kwargs))
-  else:
-    def save_fn(fn, *args, **kwargs):
-      fn(*args, **kwargs)
+    poseModel, poseState, lr_fn = setup_model(config, rng, start_camera[1])
+    poseState = flax.jax_utils.replicate(poseState)
+    
+    # (N, 2)
+    if config.pose_sampling_strategy == 'edge':
+        obs_img_prime = (np.array(obs_img) * 255).astype(np.uint8)
+        POI = find_Edge(obs_img_prime, False)
+    elif config.pose_sampling_strategy == 'edge_region':
+        obs_img_prime = (np.array(obs_img) * 255).astype(np.uint8)
+        POI = find_EdgeRegion(obs_img_prime, False)
+    else:
+        POI = None
 
-  for idx in range(dataset.size):
-    if idx % config.render_num_jobs != config.render_job_id:
-      continue
-    # If current image and next image both already exist, skip ahead.
-    idx_str = idx_to_str(idx)
-    curr_file = path_fn(f'color_{idx_str}.png')
-    next_idx_str = idx_to_str(idx + config.render_num_jobs)
-    next_file = path_fn(f'color_{next_idx_str}.png')
-    if utils.file_exists(curr_file) and utils.file_exists(next_file):
-      print(f'Image {idx}/{dataset.size} already exists, skipping')
-      continue
-    print(f'Evaluating image {idx+1}/{dataset.size}')
-    eval_start_time = time.time()
-    rays = dataset.generate_ray_batch(idx).rays
-    train_frac = 1.
-    rendering = models.render_image(
-        functools.partial(render_eval_pfn, state.params, train_frac),
-        rays, None, config)
-    print(f'Rendered in {(time.time() - eval_start_time):0.3f}s')
+    train_vstep = create_train_step(model, modelState, poseModel, start_camera, config, camtype)
 
-    if jax.host_id() != 0:  # Only record via host 0.
-      continue
+    #是否在训练时render图片
+    render_train = config.pose_render_train
+    
+    Nt = config.pose_max_steps
+    #是否使用低通滤波器
+    w_alpha = config.pose_w_alpha
+    #初始频率阈值
+    alpha0 = config.pose_alpha0
 
-    rendering['rgb'] = postprocess_fn(rendering['rgb'])
+    #创建alpha_fn
+    alpha_fn = create_alpha_fn(alpha0, 0.95, config.pose_alpha_linear)
 
-    save_fn(
-        utils.save_img_u8, rendering['rgb'], path_fn(f'color_{idx_str}.png'))
-    if 'normals' in rendering:
-      save_fn(
-          utils.save_img_u8, rendering['normals'] / 2. + 0.5,
-          path_fn(f'normals_{idx_str}.png'))
-    save_fn(
-        utils.save_img_f32, rendering['distance_mean'],
-        path_fn(f'distance_mean_{idx_str}.tiff'))
-    save_fn(
-        utils.save_img_f32, rendering['distance_median'],
-        path_fn(f'distance_median_{idx_str}.tiff'))
-    save_fn(
-        utils.save_img_f32, rendering['acc'], path_fn(f'acc_{idx_str}.tiff'))
+    # 迭代更新位姿
+    for Nc in range(Nt+1):
+        
+        alpha = alpha_fn(Nc/Nt) if w_alpha else 1.0
+            
+        lr = lr_fn(Nc)
+        
+        batch = dataset.generate_pose_batch(cam_idx, POI)
 
-  if config.render_save_async:
-    # Wait until all worker threads finish.
-    async_executor.shutdown(wait=True)
-
-    # This will ensure that exceptions in child threads are raised to the
-    # main thread.
-    for future in async_futures:
-      future.result()
-
-  time.sleep(1)
-  num_files = len(glob.glob(path_fn('acc_*.tiff')))
-  time.sleep(10)
-  if jax.host_id() == 0 and num_files == dataset.size:
-    print(f'All files found, creating videos (job {config.render_job_id}).')
-    create_videos(config, base_dir, out_dir, out_name, dataset.size)
-
-  # A hack that forces Jax to keep all TPUs alive until every TPU is finished.
-  x = jax.numpy.ones([jax.local_device_count()])
-  x = jax.device_get(jax.pmap(lambda x: jax.lax.psum(x, 'i'), 'i')(x))
-  print(x)
-
+        poseState = train_vstep(batch, poseState, alpha)
+        print(poseState.param)
+        
+    # A hack that forces Jax to keep all TPUs alive until every TPU is finished.
+    x = jax.numpy.ones([jax.local_device_count()])
+    x = jax.device_get(jax.pmap(lambda x: jax.lax.psum(x, 'i'), 'i')(x))
+    print(x)
 
 if __name__ == '__main__':
-  with gin.config_scope('eval'):  # Use the same scope as eval.py
-    app.run(main)
+    with gin.config_scope('eval'):  # Use the same scope as eval.py
+        app.run(main)
